@@ -6,17 +6,17 @@ from threading import RLock
 from time import time
 from re import search as re_search
 
-from bot import download_dict_lock, download_dict
+from bot import download_dict_lock, download_dict, STORAGE_THRESHOLD
+from bot.helper.ext_utils.bot_utils import get_readable_file_size
 from bot.helper.telegram_helper.message_utils import sendStatusMessage
 from ..status_utils.youtube_dl_download_status import YoutubeDLDownloadStatus
+from bot.helper.ext_utils.fs_utils import check_storage_threshold
 
 LOGGER = getLogger(__name__)
-
 
 class MyLogger:
     def __init__(self, obj):
         self.obj = obj
-
     def debug(self, msg):
         # Hack to fix changing extension
         match = re_search(r'.Merger..Merging formats into..(.*?).$', msg) # To mkv
@@ -26,17 +26,13 @@ class MyLogger:
             newname = match.group(1)
             newname = newname.split("/")[-1]
             self.obj.name = newname
-
     @staticmethod
     def warning(msg):
         LOGGER.warning(msg)
-
     @staticmethod
     def error(msg):
         if msg != "ERROR: Cancelling...":
             LOGGER.error(msg)
-
-
 class YoutubeDLHelper:
     def __init__(self, listener):
         self.name = ""
@@ -59,12 +55,10 @@ class YoutubeDLHelper:
                      'prefer_ffmpeg': True,
                      'cookiefile': 'cookies.txt',
                      'ffmpeg_location': '/bin/new-api'}
-
     @property
     def download_speed(self):
         with self.__resource_lock:
             return self.__download_speed
-
     def __onDownloadProgress(self, d):
         self.__downloading = True
         if self.__is_cancelled:
@@ -90,20 +84,16 @@ class YoutubeDLHelper:
                     self.progress = (self.downloaded_bytes / self.size) * 100
                 except ZeroDivisionError:
                     pass
-
     def __onDownloadStart(self):
         with download_dict_lock:
             download_dict[self.__listener.uid] = YoutubeDLDownloadStatus(self, self.__listener, self.__gid)
         self.__listener.onDownloadStart()
         sendStatusMessage(self.__listener.message, self.__listener.bot)
-
     def __onDownloadComplete(self):
         self.__listener.onDownloadComplete()
-
     def __onDownloadError(self, error):
         self.__is_cancelled = True
         self.__listener.onDownloadError(error)
-
     def extractMetaData(self, link, name, args, get_info=False):
         if args is not None:
             self.__set_args(args)
@@ -142,7 +132,6 @@ class YoutubeDLHelper:
                     self.name = newname[0]
             else:
                 self.name = f"{name}.{ext}"
-
     def __download(self, link):
         try:
             with YoutubeDL(self.opts) as ydl:
@@ -157,7 +146,6 @@ class YoutubeDLHelper:
             self.__onDownloadComplete()
         except ValueError:
             self.__onDownloadError("Download Stopped by User!")
-
     def add_download(self, link, path, name, qual, playlist, args):
         if playlist:
             self.opts['ignoreerrors'] = True
@@ -176,18 +164,22 @@ class YoutubeDLHelper:
         self.extractMetaData(link, name, args)
         if self.__is_cancelled:
             return
+        if STORAGE_THRESHOLD is not None:
+            acpt = check_storage_threshold(self.size, self.__listener.isZip)
+            if not acpt:
+                msg = f'You must leave {STORAGE_THRESHOLD}GB free storage.'
+                msg += f'\nYour File/Folder size is {get_readable_file_size(self.size)}'
+                return self.__onDownloadError(msg)
         if not self.is_playlist:
             self.opts['outtmpl'] = f"{path}/{self.name}"
         else:
             self.opts['outtmpl'] = f"{path}/{self.name}/%(title)s.%(ext)s"
         self.__download(link)
-
     def cancel_download(self):
         self.__is_cancelled = True
         LOGGER.info(f"Cancelling Download: {self.name}")
         if not self.__downloading:
             self.__onDownloadError("Download Cancelled by User!")
-
     def __set_args(self, args):
         args = args.split('|')
         for arg in args:
