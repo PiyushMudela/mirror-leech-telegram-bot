@@ -1,18 +1,16 @@
 from threading import Lock
 from pathlib import Path
 
-from bot import LOGGER, download_dict, download_dict_lock, STOP_DUPLICATE
+from bot import LOGGER, download_dict, download_dict_lock, MEGA_LIMIT, STOP_DUPLICATE, ZIP_UNZIP_LIMIT, STORAGE_THRESHOLD
 from bot.helper.telegram_helper.message_utils import sendMessage, sendMarkup, sendStatusMessage
-from bot.helper.ext_utils.bot_utils import setInterval
+from bot.helper.ext_utils.bot_utils import get_readable_file_size, setInterval
 from bot.helper.mirror_utils.upload_utils.gdriveTools import GoogleDriveHelper
-from bot.helper.ext_utils.fs_utils import get_base_name
+from bot.helper.ext_utils.fs_utils import get_base_name, check_storage_threshold
 from ..status_utils.mega_download_status import MegaDownloadStatus
 from megasdkrestclient import MegaSdkRestClient, constants
 
-
 class MegaDownloader:
     POLLING_INTERVAL = 3
-
     def __init__(self, listener):
         self.__listener = listener
         self.__name = ""
@@ -23,37 +21,30 @@ class MegaDownloader:
         self.__downloaded_bytes = 0
         self.__progress = 0
         self.__size = 0
-
     @property
     def progress(self):
         with self.__resource_lock:
             return self.__progress
-
     @property
     def downloaded_bytes(self):
         with self.__resource_lock:
             return self.__downloaded_bytes
-
     @property
     def size(self):
         with self.__resource_lock:
             return self.__size
-
     @property
     def gid(self):
         with self.__resource_lock:
             return self.__gid
-
     @property
     def name(self):
         with self.__resource_lock:
             return self.__name
-
     @property
     def download_speed(self):
         if self.gid is not None:
             return self.__mega_client.getDownloadInfo(self.gid)['speed']
-
     def __onDownloadStart(self, name, size, gid):
         self.__periodic = setInterval(self.POLLING_INTERVAL, self.__onInterval)
         with download_dict_lock:
@@ -64,7 +55,6 @@ class MegaDownloader:
             self.__gid = gid
         self.__listener.onDownloadStart()
         sendStatusMessage(self.__listener.message, self.__listener.bot)
-
     def __onInterval(self):
         dlInfo = self.__mega_client.getDownloadInfo(self.gid)
         if (dlInfo['state'] == constants.State.TYPE_STATE_COMPLETED or dlInfo[
@@ -81,7 +71,6 @@ class MegaDownloader:
             self.__onDownloadError(dlInfo['error_string'])
             return
         self.__onDownloadProgress(dlInfo['completed_length'], dlInfo['total_length'])
-
     def __onDownloadProgress(self, current, total):
         with self.__resource_lock:
             self.__downloaded_bytes = current
@@ -89,13 +78,10 @@ class MegaDownloader:
                 self.__progress = current / total * 100
             except ZeroDivisionError:
                 self.__progress = 0
-
     def __onDownloadError(self, error):
         self.__listener.onDownloadError(error)
-
     def __onDownloadComplete(self):
         self.__listener.onDownloadComplete()
-
     def add_download(self, link, path):
         Path(path).mkdir(parents=True, exist_ok=True)
         try:
@@ -122,6 +108,25 @@ class MegaDownloader:
                 if smsg:
                     msg1 = "File/Folder is already available in Drive.\nHere are the search results:"
                     return sendMarkup(msg1, self.__listener.bot, self.__listener.message, button)
+        if any([STORAGE_THRESHOLD, ZIP_UNZIP_LIMIT, MEGA_LIMIT]):
+            arch = any([self.__listener.isZip, self.__listener.extract])
+            if STORAGE_THRESHOLD is not None:
+                acpt = check_storage_threshold(file_size, arch)
+                if not acpt:
+                    msg = f'You must leave {STORAGE_THRESHOLD}GB free storage.'
+                    msg += f'\nYour File/Folder size is {get_readable_file_size(file_size)}'
+                    return sendMessage(msg, self.__listener.bot, self.__listener.message)
+            limit = None
+            if ZIP_UNZIP_LIMIT is not None and arch:
+                msg3 = f'Failed, Zip/Unzip limit is {ZIP_UNZIP_LIMIT}GB.\nYour File/Folder size is {get_readable_file_size(file_size)}.'
+                limit = ZIP_UNZIP_LIMIT
+            elif MEGA_LIMIT is not None:
+                msg3 = f'Failed, Mega limit is {MEGA_LIMIT}GB.\nYour File/Folder size is {get_readable_file_size(file_size)}.'
+                limit = MEGA_LIMIT
+            if limit is not None:
+                LOGGER.info('Checking File/Folder Size...')
+                if file_size > limit * 1024**3:
+                    return sendMessage(msg3, self.__listener.bot, self.__listener.message)
         self.__onDownloadStart(file_name, file_size, gid)
         LOGGER.info(f'Mega download started with gid: {gid}')
 
